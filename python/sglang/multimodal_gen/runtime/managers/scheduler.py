@@ -4,7 +4,7 @@
 import pickle
 from collections import deque
 from copy import deepcopy
-from typing import Any, List
+from typing import Any, List, Optional
 
 import zmq
 
@@ -12,6 +12,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.managers.batch_scheduler import (
+    BatchScheduler,
+    MemoryEstimator,
+    RequestConfig,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -33,6 +38,8 @@ class Scheduler:
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
     This class does NOT manage worker processes.
+    
+    Supports memory-aware batching when enabled via server_args.enable_batching.
     """
 
     def __init__(
@@ -80,7 +87,29 @@ class Scheduler:
             List[Req]: self._handle_generation,
         }
 
-        # FIFO, new reqs are appended
+        # Initialize batching
+        self.enable_batching = server_args.enable_batching
+        if self.enable_batching:
+            self.memory_estimator = MemoryEstimator(
+                device_id=gpu_id,
+                safety_margin=server_args.memory_safety_margin,
+            )
+            self.batch_scheduler = BatchScheduler(
+                memory_estimator=self.memory_estimator,
+                max_batch_size=server_args.max_batch_size,
+                max_wait_time_s=server_args.batch_max_wait_time_s,
+            )
+            logger.info(
+                f"Batching enabled: max_batch_size={server_args.max_batch_size}, "
+                f"max_wait_time={server_args.batch_max_wait_time_s}s, "
+                f"memory_safety_margin={server_args.memory_safety_margin}"
+            )
+        else:
+            self.batch_scheduler = None
+            self.memory_estimator = None
+            logger.info("Batching disabled, processing requests sequentially")
+
+        # Legacy queue for non-batching mode
         self.waiting_queue: deque[tuple[bytes, Req]] = deque()
 
         self.warmed_up = False
@@ -101,8 +130,55 @@ class Scheduler:
         req = reqs[0]
         return self.worker.unmerge_lora_weights(req.target)
 
-    def _handle_generation(self, reqs: List[Req]):
-        return self.worker.execute_forward(reqs)
+    def _handle_generation(self, reqs: List[Req]) -> OutputBatch:
+        """
+        Handle generation request.
+        
+        When batching is enabled, reqs contains a single merged Req with
+        all prompts from the batch combined.
+        """
+        # reqs always contains exactly one (potentially merged) Req
+        return self.worker.execute_forward(reqs[0])
+
+    def _split_batch_output(
+        self,
+        output_batch: OutputBatch,
+        num_requests: int,
+        config: Optional[RequestConfig],
+    ) -> List[OutputBatch]:
+        """
+        Split a batched OutputBatch into individual results for each client.
+        
+        Args:
+            output_batch: The batched output from the worker
+            num_requests: Number of requests in the batch
+            config: The request configuration
+            
+        Returns:
+            List of OutputBatch, one per client
+        """
+        if num_requests == 1 or output_batch.output is None:
+            return [output_batch]
+        
+        results = []
+        outputs_per_request = config.effective_batch_size if config else 1
+        
+        for i in range(num_requests):
+            start_idx = i * outputs_per_request
+            end_idx = start_idx + outputs_per_request
+            
+            # Slice the output tensor for this client
+            client_output = output_batch.output[start_idx:end_idx]
+            
+            single = OutputBatch(
+                output=client_output,
+                timings=output_batch.timings,  # Shared timing info
+                peak_memory_mb=output_batch.peak_memory_mb / num_requests,
+                error=output_batch.error,
+            )
+            results.append(single)
+        
+        return results
 
     def return_result(
         self,
@@ -111,24 +187,69 @@ class Scheduler:
         is_warmup: bool = False,
     ):
         """
-        replies to client, only on rank 0
+        Send results back to client(s).
+        When batching is enabled, distributes results to all batch members.
         """
-        if not is_warmup and self.receiver is not None and identity is not None:
-            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+        if is_warmup or self.receiver is None:
+            return
+        
+        if self.enable_batching and self.batch_scheduler is not None:
+            identities, config, batch_size = self.batch_scheduler.get_current_batch_info()
+            
+            if not identities:
+                # Fallback to single identity
+                if identity is not None:
+                    self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+                return
+            
+            # Record memory usage for future estimation
+            if output_batch.peak_memory_mb > 0:
+                self.batch_scheduler.record_execution(output_batch.peak_memory_mb)
+            
+            # Split and distribute results
+            if batch_size > 1 and output_batch.output is not None:
+                split_outputs = self._split_batch_output(output_batch, batch_size, config)
+                for ident, single_output in zip(identities, split_outputs):
+                    self.receiver.send_multipart([ident, b"", pickle.dumps(single_output)])
+                logger.debug(f"Distributed results to {batch_size} clients")
+            else:
+                # Single request or error - send same result to all
+                for ident in identities:
+                    self.receiver.send_multipart([ident, b"", pickle.dumps(output_batch)])
+            
+            # Clear batch tracking
+            self.batch_scheduler.clear_current_batch()
+        else:
+            # Non-batching mode
+            if identity is not None:
+                self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
-        """pull a req from waiting_queue"""
-        if not self.waiting_queue:
-            return None
-
-        # pop the first (earliest)
-        item = self.waiting_queue.popleft()
-
-        return [item]
+        """
+        Get the next batch of requests to run.
+        
+        When batching is enabled, uses BatchScheduler to form optimal batches.
+        Otherwise, returns single requests from the waiting queue.
+        """
+        if self.enable_batching and self.batch_scheduler is not None:
+            result = self.batch_scheduler.get_next_batch()
+            if result is None:
+                return None
+            
+            identities, merged_req, config = result
+            # Return in expected format - the merged req with first identity
+            return [(identities[0], merged_req)]
+        else:
+            # Legacy non-batching mode
+            if not self.waiting_queue:
+                return None
+            item = self.waiting_queue.popleft()
+            return [item]
 
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
-        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
+        Receive requests from clients.
+        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj.
         """
         if self.receiver is not None:
             try:
@@ -151,7 +272,7 @@ class Scheduler:
         else:
             recv_reqs = None
 
-        # TODO: fix this condition
+        # Broadcast to parallel workers
         if self.server_args.sp_degree != 1:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
@@ -178,8 +299,8 @@ class Scheduler:
 
         assert recv_reqs is not None
 
-        # handle server warmup by inserting an identical req to the beginning of the waiting queue
-        # only the very first req through server's lifetime will be warmup
+        # Handle server warmup by inserting an identical req to the beginning
+        # Only the very first req through server's lifetime will be warmup
         if (
             not self.warmed_up
             and len(recv_reqs) == 1
@@ -196,22 +317,35 @@ class Scheduler:
 
         return recv_reqs
 
+    def _add_requests_to_queue(self, requests: List[tuple[bytes, Any]]) -> None:
+        """
+        Add received requests to the appropriate queue.
+        Separates generation requests from control requests.
+        """
+        for identity, req in requests:
+            if isinstance(req, Req):
+                if self.enable_batching and self.batch_scheduler is not None:
+                    self.batch_scheduler.add_request(identity, req)
+                else:
+                    self.waiting_queue.append((identity, req))
+            else:
+                # Control requests (LoRA, etc.) go to legacy queue
+                self.waiting_queue.append((identity, req))
+
     def event_loop(self) -> None:
         """
         The main event loop that listens for ZMQ requests.
-        Handles abortion
+        Handles request batching and execution.
         """
-
         logger.debug(
             f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
         )
 
         while self._running:
-            # 1: receive requests
+            # 1: Receive and queue requests
             try:
                 new_reqs = self.recv_reqs()
-                # after processing input reqs
-                self.waiting_queue.extend(new_reqs)
+                self._add_requests_to_queue(new_reqs)
             except Exception as e:
                 logger.error(
                     f"Error receiving requests in scheduler event loop: {e}",
@@ -219,7 +353,7 @@ class Scheduler:
                 )
                 continue
 
-            # 2: execute, make sure a reply is always sent
+            # 2: Get next batch and execute
             items = self.get_next_batch_to_run()
             if not items:
                 continue
@@ -241,16 +375,14 @@ class Scheduler:
                     f"Error executing request in scheduler event loop: {e}",
                     exc_info=True,
                 )
-                # Determine appropriate error response format
                 output_batch = (
                     OutputBatch(error=str(e))
                     if reqs and isinstance(reqs[0], Req)
                     else OutputBatch(error=str(e))
                 )
 
-            # 3. return results
+            # 3: Return results to client(s)
             try:
-                # TODO: Support sending back to multiple identities if batched
                 is_warmup = (
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )

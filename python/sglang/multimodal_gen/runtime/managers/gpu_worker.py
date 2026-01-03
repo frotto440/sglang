@@ -111,14 +111,30 @@ class GPUWorker:
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
 
-    def execute_forward(self, batch: List[Req]) -> OutputBatch:
+    def execute_forward(self, req: Req) -> OutputBatch:
         """
-        Execute a forward pass.
+        Execute a forward pass for a (potentially batched) request.
+        
+        When batching is enabled, the Req may contain merged prompts from multiple
+        clients. The Req.batch_size property reflects the total number of outputs
+        to generate across all prompts.
+        
+        Args:
+            req: The request to execute. May contain multiple prompts when batching.
+            
+        Returns:
+            OutputBatch with generated outputs (shape [batch_size, ...])
         """
         assert self.pipeline is not None
-        # TODO: dealing with first req for now
-        req = batch[0]
         output_batch = None
+        
+        # Log batch info
+        batch_size = req.batch_size
+        if batch_size > 1:
+            logger.info(
+                f"Executing batched request {req.request_id} with batch_size={batch_size}"
+            )
+        
         try:
             if self.rank == 0:
                 torch.cuda.reset_peak_memory_stats()
@@ -138,14 +154,24 @@ class GPUWorker:
                 can_stay_resident = self.get_can_stay_resident_components(
                     remaining_gpu_mem_gb
                 )
+                
+                # Include batch size in memory logging
+                per_output_memory_gb = peak_memory_gb / max(1, batch_size)
                 logger.info(
-                    f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+                    f"Peak GPU memory: {peak_memory_gb:.2f} GB "
+                    f"({per_output_memory_gb:.2f} GB/output for batch_size={batch_size}), "
                     f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
                     f"Components that can stay resident: {can_stay_resident}"
                 )
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
+            
+            if batch_size > 1:
+                logger.info(
+                    f"Batch {req.request_id} completed in {duration_ms/1000:.2f}s "
+                    f"({duration_ms/batch_size:.0f}ms per output)"
+                )
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:

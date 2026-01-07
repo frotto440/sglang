@@ -52,63 +52,90 @@ class TextEncodingStage(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
         """
-        Encode the prompt into text encoder hidden states.
+        Encode the prompts into text encoder hidden states.
 
         Args:
             batch: The current batch information.
             server_args: The inference arguments.
 
         Returns:
-            The batch with encoded prompt embeddings.
+            The batch with encoded prompts embeddings.
         """
-        assert len(self.tokenizers) == len(self.text_encoders)
-        assert len(self.text_encoders) == len(
-            server_args.pipeline_config.text_encoder_configs
-        )
+        if batch.is_prompt_processed:
+            return batch
 
-        # Encode positive prompt with all available encoders
-        assert batch.prompt is not None
-        prompt_text: str | list[str] = batch.prompt
-
+        # Normalize prompts to list for batch processing
+        logger.info("Running local codebase")
+        prompts: list[str] = batch.prompts_as_list
+        negative_prompts: list[str] = batch.negative_prompts_as_list
+        
+        batch_size = len(prompts)
+        # logger.debug(f"Encoding {batch_size} prompts in batch")
+        logger.info(f"Encoding {batch_size} prompts in batch")
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
+        # Encode all positive prompts together
         prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
-            prompt_text,
+            prompts,  # Pass full list for batched encoding
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
         )
 
-        for pe in prompt_embeds_list:
-            batch.prompt_embeds.append(pe)
+        # Store batched embeddings - shape: [batch_size, seq_len, hidden_dim]
+        batch.prompt_embeds = prompt_embeds_list
+        if prompt_masks_list:
+            batch.prompt_attention_mask = prompt_masks_list
+        if pooler_embeds_list:
+            batch.pooled_embeds = pooler_embeds_list
 
-        for pe in pooler_embeds_list:
-            batch.pooled_embeds.append(pe)
-        if batch.prompt_attention_mask is not None:
-            for am in prompt_masks_list:
-                batch.prompt_attention_mask.append(am)
-
-        # Encode negative prompt if CFG is enabled
+        # Encode negative prompts if using CFG
         if batch.do_classifier_free_guidance:
-            assert isinstance(batch.negative_prompt, str)
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-                batch.negative_prompt,
+            neg_embeds_list, neg_masks_list, neg_pooler_list = self.encode_text(
+                negative_prompts,
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
             )
+            batch.negative_prompt_embeds = neg_embeds_list
+            if neg_masks_list:
+                batch.negative_attention_mask = neg_masks_list
+            if neg_pooler_list:
+                batch.neg_pooled_embeds = neg_pooler_list
 
-            assert batch.negative_prompt_embeds is not None
+        if batch.per_prompt_num_outputs:
+            expansion_factors = torch.tensor(batch.per_prompt_num_outputs)
+        else:
+            expansion_factors = batch.num_outputs_per_prompt
+    
+        if expansion_factors > 1:
+            batch.prompt_embeds = [
+                pe.repeat_interleave(expansion_factors, dim=0) for pe in prompt_embeds_list
+            ]
+            batch.pooled_embeds = [
+                pe.repeat_interleave(expansion_factors, dim=0) for pe in pooler_embeds_list
+            ]
 
-            for ne in neg_embeds_list:
-                batch.negative_prompt_embeds.append(ne)
+            if batch.do_classifier_free_guidance:
+                batch.negative_prompt_embeds = [
+                    pe.repeat_interleave(expansion_factors, dim=0) for pe in neg_embeds_list
+                ]
+                batch.negative_prompt_embeds = [
+                    pe.repeat_interleave(expansion_factors, dim=0) for pe in neg_embeds_list
+                ]
+                if neg_masks_list:
+                    batch.negative_attention_mask = [
+                        pe.repeat_interleave(expansion_factors, dim=0) for pe in neg_masks_list
+                    ]
+                if neg_pooler_list:
+                    batch.neg_pooled_embeds = [
+                        pe.repeat_interleave(expansion_factors, dim=0) for pe in neg_pooler_list
+                    ]
 
-            for pe in neg_pooler_embeds_list:
-                batch.neg_pooled_embeds.append(pe)
-            if batch.negative_attention_mask is not None:
-                for nm in neg_masks_list:
-                    batch.negative_attention_mask.append(nm)
-
+        batch.is_prompt_processed = True
+        logger.info("Succesfully encoded texts")
+        logger.info(f"{len(batch.prompt_embeds)}")
+        logger.info(f"{batch.prompt_embeds[0].shape}")
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -118,7 +145,7 @@ class TextEncodingStage(PipelineStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+            lambda x: not batch.do_classifier_free_guidance or V.string_or_list_strings(x),
         )
         result.add_check(
             "do_classifier_free_guidance",

@@ -56,6 +56,7 @@ class LatentPreparationStage(PipelineStage):
             latent_num_frames = self.adjust_video_length(batch, server_args)
 
         batch_size = batch.batch_size
+        logger.info(f"LP - batch size: {batch_size}")
 
         # Get required parameters
         dtype = batch.prompt_embeds[0].dtype
@@ -103,6 +104,7 @@ class LatentPreparationStage(PipelineStage):
         if hasattr(self.scheduler, "init_noise_sigma"):
             latents = latents * self.scheduler.init_noise_sigma
         # Update batch with prepared latents
+        logger.info(f"Latents preprations - latens shape: {latents.shape}")
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
         return batch

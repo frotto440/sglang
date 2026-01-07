@@ -118,6 +118,7 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
+        logger.info(f"Decoding - latens shape: {latents.shape}")
         self.vae = self.vae.to(get_local_torch_device())
         latents = latents.to(get_local_torch_device())
         # Setup VAE precision

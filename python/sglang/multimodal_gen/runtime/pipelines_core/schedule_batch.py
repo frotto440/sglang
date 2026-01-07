@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, List
 
 import PIL.Image
 import torch
@@ -88,6 +88,7 @@ class Req:
 
     # Batch info
     num_outputs_per_prompt: int = 1
+    per_prompt_num_outputs: list[int] | None = None
     seed: int | None = None
     seeds: list[int] | None = None
     generator_device: str = (
@@ -204,6 +205,24 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
+    @property
+    def prompts_as_list(self) -> list[str]:
+        """Always return prompts as a list."""
+        if self.prompt is None:
+            return []
+        if isinstance(self.prompt, str):
+            return [self.prompt]
+        return self.prompt
+
+    @property
+    def negative_prompts_as_list(self) -> list[str]:
+        """Always return negative prompts as a list matching batch size."""
+        if self.negative_prompt is None:
+            return [""] * self.batch_size
+        if isinstance(self.negative_prompt, str):
+            return [self.negative_prompt] * self.batch_size
+        return self.negative_prompt
+
     def output_file_path(self, num_outputs=1, output_idx=None):
         output_file_name = self.output_file_name
         if num_outputs > 1 and output_file_name:
@@ -227,6 +246,14 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
         self.timings = RequestTimings(request_id=self.request_id)
+
+
+    def get_fps_for_index(self, idx: int) -> int:
+        """Get fps for a specific batch index."""
+        if isinstance(self.fps, list):
+            return self.fps[idx] if idx < len(self.fps) else self.fps[0]
+        return self.fps
+
 
     def adjust_size(self, server_args: ServerArgs):
         pass

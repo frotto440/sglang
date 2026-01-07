@@ -145,6 +145,7 @@ class Scheduler:
         output_batch: OutputBatch,
         num_requests: int,
         config: Optional[RequestConfig],
+        per_request_counts: list[int]
     ) -> List[OutputBatch]:
         """
         Split a batched OutputBatch into individual results for each client.
@@ -163,13 +164,11 @@ class Scheduler:
         results = []
         outputs_per_request = config.effective_batch_size if config else 1
         
-        for i in range(num_requests):
-            start_idx = i * outputs_per_request
-            end_idx = start_idx + outputs_per_request
-            
-            # Slice the output tensor for this client
-            client_output = output_batch.output[start_idx:end_idx]
-            
+        current_idx = 0
+        for count in per_request_counts:
+            client_output = output_batch.output[current_idx:current_idx + count]
+            current_idx += count
+
             single = OutputBatch(
                 output=client_output,
                 timings=output_batch.timings,  # Shared timing info
@@ -177,7 +176,7 @@ class Scheduler:
                 error=output_batch.error,
             )
             results.append(single)
-        
+
         return results
 
     def return_result(
@@ -194,7 +193,7 @@ class Scheduler:
             return
         
         if self.enable_batching and self.batch_scheduler is not None:
-            identities, config, batch_size = self.batch_scheduler.get_current_batch_info()
+            identities, config, batch_size, per_request_counts = self.batch_scheduler.get_current_batch_info()
             
             if not identities:
                 # Fallback to single identity
@@ -208,7 +207,7 @@ class Scheduler:
             
             # Split and distribute results
             if batch_size > 1 and output_batch.output is not None:
-                split_outputs = self._split_batch_output(output_batch, batch_size, config)
+                split_outputs = self._split_batch_output(output_batch, batch_size, config, per_request_counts)
                 for ident, single_output in zip(identities, split_outputs):
                     self.receiver.send_multipart([ident, b"", pickle.dumps(single_output)])
                 logger.debug(f"Distributed results to {batch_size} clients")
@@ -252,23 +251,22 @@ class Scheduler:
         For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj.
         """
         if self.receiver is not None:
-            try:
+            recv_reqs = []
+            # Drain all requests
+            while True:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
-                    recv_reqs = []
-            except zmq.ZMQError:
-                # re-raise or handle appropriately to let the outer loop continue
-                raise
+                    try:
+                        identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
+                        req = pickle.loads(payload)
 
-            if recv_reqs:
-                # Ensure recv_reqs is a list
-                if not isinstance(recv_reqs, list):
-                    recv_reqs = [recv_reqs]
-
-                # Pack with identity for rank 0
-                recv_reqs = [(identity, req) for req in recv_reqs]
+                        if not isinstance(req, list):
+                            req = [req]
+                        recv_reqs.extend([(identity, r) for r in req])                        
+                    except zmq.Again:
+                        break
+                except zmq.ZMQError:
+                    # re-raise or handle appropriately to let the outer loop continue
+                    raise
         else:
             recv_reqs = None
 
@@ -362,13 +360,13 @@ class Scheduler:
             reqs = [item[1] for item in items]
 
             try:
-                processed_req = reqs[0]
-                handler = self.request_handlers.get(type(processed_req))
+                first_req = reqs[0]
+                handler = self.request_handlers.get(type(first_req))
                 if handler:
                     output_batch = handler(reqs)
                 else:
                     output_batch = OutputBatch(
-                        error=f"Unknown request type: {type(processed_req)}"
+                        error=f"Unknown request type: {type(first_req)}"
                     )
             except Exception as e:
                 logger.error(
@@ -384,7 +382,7 @@ class Scheduler:
             # 3: Return results to client(s)
             try:
                 is_warmup = (
-                    processed_req.is_warmup if isinstance(processed_req, Req) else False
+                    first_req.is_warmup if isinstance(first_req, Req) else False
                 )
                 if is_warmup:
                     logger.info(
@@ -392,7 +390,7 @@ class Scheduler:
                         output_batch.timings.total_duration_s,
                     )
 
-                self.return_result(output_batch, identities[0], is_warmup=is_warmup)
+                self.return_result(output_batch,  identities[0], is_warmup=is_warmup)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")

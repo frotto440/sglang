@@ -305,6 +305,7 @@ class BatchScheduler:
         self._current_batch_identities: List[bytes] = []
         self._current_batch_config: Optional[RequestConfig] = None
         self._current_batch_size: int = 0
+        self._current_batch_per_request_counts: list[int] = []
 
     def add_request(self, identity: bytes, req: "Req") -> None:
         """Add a new request to the appropriate bucket."""
@@ -405,11 +406,12 @@ class BatchScheduler:
         
         # Collect batch
         batch = []
+
         for _ in range(max_size):
             if queue:
                 batch.append(queue.popleft())
                 self._total_queued -= 1
-        
+
         return batch
 
     def _merge_requests(self, queued_items: List[QueuedRequest]) -> "Req":
@@ -423,7 +425,7 @@ class BatchScheduler:
         if len(queued_items) == 1:
             return queued_items[0].req
         
-        from copy import copy
+        from copy import deepcopy
         
         base_req = queued_items[0].req
         
@@ -431,24 +433,18 @@ class BatchScheduler:
         all_prompts = []
         all_negative_prompts = []
         all_seeds = []
-        
+        per_prompt_num_outputs = []
+
         for item in queued_items:
             req = item.req
             
-            # Handle prompt (str or list)
-            if isinstance(req.prompt, list):
-                all_prompts.extend(req.prompt)
-            elif req.prompt is not None:
-                all_prompts.append(req.prompt)
-            
+            all_prompts.extend(req.prompts_as_list)
+
             # Handle negative prompt
             if req.negative_prompt:
-                if isinstance(req.negative_prompt, list):
-                    all_negative_prompts.extend(req.negative_prompt)
-                else:
-                    all_negative_prompts.append(req.negative_prompt)
+                all_negative_prompts.extend(req.negative_prompts_as_list)
             
-            # Handle seeds
+            # Handle seeds: TODO: ???
             if req.seeds:
                 all_seeds.extend(req.seeds)
             elif req.seed is not None:
@@ -456,14 +452,21 @@ class BatchScheduler:
                 for i in range(req.num_outputs_per_prompt):
                     all_seeds.append(req.seed + i)
         
+            num_prompts = len(req.prompts_as_list)
+            per_prompt_num_outputs.extend([req.num_outputs_per_prompt] * num_prompts)
+            
+        self._current_batch_per_request_counts = per_prompt_num_outputs
+        
         # Create merged request
-        merged = copy(base_req)
+        merged = deepcopy(base_req)
         merged.prompt = all_prompts
         merged.negative_prompt = all_negative_prompts if all_negative_prompts else None
         merged.seeds = all_seeds if all_seeds else None
-        merged.seed = None  # Use seeds list instead
+        # merged.seed = None  # Use seeds list instead
+        merged.seed = queued_items[0].req.seed
         merged.request_id = f"batch_{len(queued_items)}_{base_req.request_id}"
-        
+        merged.per_prompt_num_outputs = per_prompt_num_outputs
+
         logger.info(
             f"Merged {len(queued_items)} requests into batch with "
             f"{len(all_prompts)} prompts × {base_req.num_outputs_per_prompt} outputs = "
@@ -530,7 +533,8 @@ class BatchScheduler:
         return (
             self._current_batch_identities,
             self._current_batch_config,
-            self._current_batch_size
+            self._current_batch_size,
+            self._current_batch_per_request_counts
         )
 
     def clear_current_batch(self) -> None:
@@ -538,4 +542,5 @@ class BatchScheduler:
         self._current_batch_identities = []
         self._current_batch_config = None
         self._current_batch_size = 0
+        self._current_batch_per_request_counts = []
 
